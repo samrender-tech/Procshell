@@ -25,7 +25,7 @@ static void printBanner(void)
   printf(" |_|   |_|  \\___/ \\___|___/_| |_|\\___|_|_|\n");
   printf("\033[0m\n");
   printf(" A Unix shell built from scratch in C, with AI assistance\n\n");
-  printf(" by \033[1mSamrender Singh Saini\033[0m\n\n");
+  printf(" by \033[1mSamrender Singh Saini\033[0m & \033[1mVartika Chaudhary\033[0m\n\n");
   printf(" Type \033[1mhelp\033[0m for commands, \033[1mai <request>\033[0m to ask the AI, \033[1mexit\033[0m to quit.\n\n");
   fflush(stdout);
 }

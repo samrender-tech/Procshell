@@ -17,7 +17,7 @@ On top of that it adds three things a normal terminal does not have:
 - **Trace mode** — `trace on` prints every `pipe`, `fork`, `exec`, `wait` and signal as it happens, plus CPU time and peak memory for each command.
 - **An AI assistant** — `ai <plain English>` turns a request into shell commands, shows them, and runs them only after you confirm.
 
-Built by **Samrender Singh Saini** as an Operating Systems project at VIT Vellore.
+Built by **Samrender Singh Saini** and **Vartika Chaudhary** as an Operating Systems project at VIT Vellore.
 
 ---
 
@@ -244,4 +244,4 @@ Known limitations are tracked in [`docs/bugs.md`](docs/bugs.md).
 
 ## License
 
-[MIT](LICENSE) © 2026 Samrender Singh Saini
+[MIT](LICENSE) © 2026 Samrender Singh Saini and Vartika Chaudhary
