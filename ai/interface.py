@@ -12,6 +12,7 @@ Exit code 0 = aiOutput.txt was written, 1 = something went wrong (message on std
 """
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -27,9 +28,16 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
 # Groq (https://console.groq.com) runs models on its own fast chips - usually ~1 second.
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]  # GROQ_MODEL=... in .env goes first
+# The small model first: it answers fastest and is enough for shell commands.
+GROQ_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+NOT_CHAT_MODELS = ("whisper", "orpheus", "guard", "tts", "distil")  # speech / safety models can't answer
+MAX_REPLY_TOKENS = 1024  # a shorter reply finishes sooner
 
-REQUEST_TIMEOUT_SECONDS = 60
+CACHE_FILE = "aiCache.json"  # repeated questions are answered from here instantly
+CACHE_LIMIT = 200
+
+REQUEST_TIMEOUT_SECONDS = 20  # per model: a slow model is skipped, not waited on
 BUSY_RETRIES = 2  # retries per model when Google answers "busy" (503/429)
 RETRYABLE = (404, 429, 500, 503)  # busy, overloaded, or model not available to this key
 
@@ -149,57 +157,101 @@ def post(requests, url, headers, body):
         raise ProviderError(f"network error: {e}")
 
 
+def groq_error_text(resp):
+    try:
+        return resp.json()["error"]["message"][:160]
+    except (ValueError, KeyError, TypeError):
+        return resp.text[:160]
+
+
+def groq_available_models(requests, headers):
+    """Ask Groq which models this key can use (used when the usual ones return 404)."""
+    try:
+        resp = requests.get(GROQ_MODELS_URL, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        ids = [m.get("id", "") for m in resp.json().get("data", []) if m.get("active", True)]
+    except Exception:
+        return []
+    return [i for i in ids if i and not any(word in i.lower() for word in NOT_CHAT_MODELS)]
+
+
 def ask_groq(requests, prompt, api_key):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    tried = set()
     last = None
-    for model in ordered(GROQ_MODELS, os.getenv("GROQ_MODEL")):
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},  # Groq JSON mode: reply is guaranteed JSON
-            "temperature": 0.2,
-        }
-        for attempt in range(1, BUSY_RETRIES + 1):
-            resp = post(requests, GROQ_ENDPOINT, headers, body)
-            if resp.status_code in (429, 500, 503) and attempt < BUSY_RETRIES:
-                time.sleep(attempt)
+
+    def try_models(models):
+        nonlocal last
+        for model in models:
+            if model in tried:
                 continue
-            break
-        if resp.status_code == 200:
+            tried.add(model)
+            body = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},  # Groq JSON mode: reply is guaranteed JSON
+                "temperature": 0.2,
+                "max_tokens": MAX_REPLY_TOKENS * (3 if "gpt-oss" in model else 1),  # reasoning models need room
+            }
             try:
-                return json.loads(resp.json()["choices"][0]["message"]["content"])
-            except (KeyError, IndexError, ValueError):
-                last = "reply was not valid JSON"
+                for attempt in range(1, BUSY_RETRIES + 1):
+                    resp = post(requests, GROQ_ENDPOINT, headers, body)
+                    if resp.status_code in (429, 500, 503) and attempt < BUSY_RETRIES:
+                        time.sleep(attempt)
+                        continue
+                    break
+            except ProviderError as e:  # this model timed out: try the next one
+                last = f"{model}: {e}"
                 continue
-        if resp.status_code in (401, 403):
-            raise ProviderError("key rejected - check GROQ_API_KEY in .env")
-        last = f"error {resp.status_code}"
-    raise ProviderError(f"all Groq models failed ({last})")
+            if resp.status_code == 200:
+                try:
+                    return json.loads(resp.json()["choices"][0]["message"]["content"]), model
+                except (KeyError, IndexError, ValueError, TypeError):
+                    last = f"{model}: reply was not valid JSON"
+                    continue
+            if resp.status_code == 401:
+                raise ProviderError("key rejected - check GROQ_API_KEY in .env")
+            last = f"{model}: error {resp.status_code} ({groq_error_text(resp)})"
+        return None
+
+    found = try_models(ordered(GROQ_MODELS, os.getenv("GROQ_MODEL")))
+    if found is None:  # none of the usual models worked: use whatever this key has access to
+        found = try_models(groq_available_models(requests, headers)[:4])
+    if found is None:
+        raise ProviderError(f"no Groq model answered (last: {last})")
+    return found
 
 
 def ask_gemini(requests, prompt, api_key):
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-    base_config = {"responseMimeType": "application/json"}
+    base_config = {"responseMimeType": "application/json", "maxOutputTokens": 4 * MAX_REPLY_TOKENS}
     # Ask bigger models to think less (faster). If a model rejects this (HTTP 400), resend without it.
     fast_config = dict(base_config, thinkingConfig={"thinkingLevel": "low"})
 
     resp = None
+    used = None
     for model in ordered(FALLBACK_MODELS, os.getenv("GEMINI_MODEL")):
+        used = model
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         fast = "lite" not in model
         for attempt in range(1, BUSY_RETRIES + 1):
             config = fast_config if fast else base_config
-            resp = post(requests, url, headers, {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": config})
-            if resp.status_code == 400 and fast:
-                fast = False
-                resp = post(requests, url, headers, {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": base_config})
+            try:
+                resp = post(requests, url, headers, {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": config})
+                if resp.status_code == 400 and fast:
+                    fast = False
+                    resp = post(requests, url, headers, {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": base_config})
+            except ProviderError:  # this model timed out: move on to the next model
+                resp = None
+                break
             if resp.status_code in (429, 500, 503) and attempt < BUSY_RETRIES:
                 time.sleep(2 * attempt)
                 continue
             break
-        if resp.status_code not in RETRYABLE:
+        if resp is not None and resp.status_code not in RETRYABLE:
             break  # success, or an error another model won't fix
 
+    if resp is None:
+        raise ProviderError(f"no Gemini model answered within {REQUEST_TIMEOUT_SECONDS} seconds")
     if resp.status_code != 200:
         if resp.status_code in RETRYABLE:
             raise ProviderError(f"all Gemini models are busy (error {resp.status_code})")
@@ -207,7 +259,7 @@ def ask_gemini(requests, prompt, api_key):
             raise ProviderError(f"request rejected (error {resp.status_code}) - check GEMINI_API_KEY in .env")
         raise ProviderError(f"error {resp.status_code}: {resp.text[:200]}")
     try:
-        return json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+        return json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"]), used
     except (KeyError, IndexError, ValueError):
         raise ProviderError("reply was not valid JSON")
 
@@ -228,16 +280,47 @@ def ask_model(prompt):
     spin = threading.Thread(target=spinner, args=(stop_event,))
     spin.start()
     errors = []
+    start = time.perf_counter()
     try:
         for name, ask, key in providers:
             try:
-                return ask(requests, prompt, key)
+                reply, model = ask(requests, prompt, key)
+                stop_event.set()
+                spin.join()
+                elapsed = time.perf_counter() - start
+                sys.stderr.write(f"\033[2m⚡ answered by {name} {model} in {elapsed:.2f} s\033[0m\n")
+                return reply
             except ProviderError as e:
                 errors.append(f"{name}: {e}")
     finally:
         stop_event.set()
         spin.join()
     fail("; ".join(errors) + " - please try again in a minute")
+
+
+def cache_key(user_input, platform_info):
+    """Same request in the same folder on the same OS -> same key."""
+    text = " ".join(user_input.lower().split()) + "\n" + platform_info
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def cache_load(data_dir):
+    try:
+        with open(os.path.join(data_dir, CACHE_FILE)) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def cache_save(data_dir, cache):
+    while len(cache) > CACHE_LIMIT:  # dicts keep insertion order: drop the oldest
+        cache.pop(next(iter(cache)))
+    try:
+        with open(os.path.join(data_dir, CACHE_FILE), "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
 
 
 def main():
@@ -267,7 +350,22 @@ Errors from the previous attempt (if any):
 {read_context(args.data_dir, ERROR_FILE)}
 """ + PROMPT_RULES
 
-    reply = ask_model(prompt)
+    # A repeated request (same words, same folder, no error to fix) is answered from the cache
+    platform_info = read_context(args.data_dir, PLATFORM_FILE)
+    use_cache = os.getenv("AI_CACHE", "1") != "0" and not read_context(args.data_dir, ERROR_FILE)
+    key = cache_key(args.userInput, platform_info)
+    cache = cache_load(args.data_dir) if use_cache else {}
+
+    started = time.perf_counter()
+    if key in cache:
+        reply = cache[key]
+        sys.stderr.write(f"\033[2m⚡ answered from cache in {(time.perf_counter() - started) * 1000:.1f} ms\033[0m\n")
+    else:
+        reply = ask_model(prompt)
+        if use_cache and isinstance(reply, dict) and reply.get("commands"):
+            cache[key] = reply
+            cache_save(args.data_dir, cache)
+
     if not isinstance(reply, dict):
         fail("the AI reply had an unexpected format")
 
