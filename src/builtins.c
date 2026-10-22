@@ -1,3 +1,5 @@
+#include <poll.h>
+#include <sys/stat.h>
 #include "procshell.h"
 extern ForgettingDoublyLinkedList *history;
 
@@ -182,12 +184,14 @@ static bool askToRunCommands(void)
 }
 
 /*
- * Runs the AI's commands with bash and copies everything they print on stderr
- * into the error file, so the next attempt can show the AI what went wrong.
+ * Runs the AI's commands with bash. Both stdout and stderr come back to us through pipes:
+ * stdout is shown live and counted (so we know if the commands printed anything),
+ * stderr is shown live and also saved, so the next attempt can show the AI what went wrong.
  * Returns bash's exit code (0 = all commands succeeded), or -1 on failure to start.
  */
-static int runAICommands(AICommands *commands, const char *scriptPath, const char *errorPath)
+static int runAICommands(AICommands *commands, const char *scriptPath, const char *errorPath, long *stdoutBytes)
 {
+  *stdoutBytes = 0;
   FILE *fp = fopen(scriptPath, "w");
   if (!fp)
   {
@@ -199,10 +203,17 @@ static int runAICommands(AICommands *commands, const char *scriptPath, const cha
     fprintf(fp, "%s\n", commands->commands[i]);
   fclose(fp);
 
-  int errPipe[2];
+  int outPipe[2], errPipe[2];
+  if (pipe(outPipe) == -1)
+  {
+    perror("pipe");
+    return -1;
+  }
   if (pipe(errPipe) == -1)
   {
     perror("pipe");
+    close(outPipe[0]);
+    close(outPipe[1]);
     return -1;
   }
 
@@ -210,14 +221,19 @@ static int runAICommands(AICommands *commands, const char *scriptPath, const cha
   if (pid == -1)
   {
     perror("fork");
+    close(outPipe[0]);
+    close(outPipe[1]);
     close(errPipe[0]);
     close(errPipe[1]);
     return -1;
   }
-  if (pid == 0) // child: bash with stderr going into our pipe
+  if (pid == 0) // child: bash with stdout and stderr going into our pipes
   {
+    close(outPipe[0]);
     close(errPipe[0]);
+    dup2(outPipe[1], STDOUT_FILENO);
     dup2(errPipe[1], STDERR_FILENO);
+    close(outPipe[1]);
     close(errPipe[1]);
     sigprocmask(SIG_SETMASK, &shellOrigMask, NULL);
     char *bashArgs[] = {"bash", (char *)scriptPath, NULL};
@@ -226,25 +242,48 @@ static int runAICommands(AICommands *commands, const char *scriptPath, const cha
     _exit(127);
   }
 
-  // parent: show stderr live AND save it for the AI
+  // parent: read both pipes until bash closes them (poll waits for whichever has data)
+  close(outPipe[1]);
   close(errPipe[1]);
   FILE *errorFile = fopen(errorPath, "w");
+  struct pollfd fds[2] = {{outPipe[0], POLLIN, 0}, {errPipe[0], POLLIN, 0}};
+  int open = 2;
   char buf[4096];
-  for (;;)
+  while (open > 0)
   {
-    ssize_t r = read(errPipe[0], buf, sizeof(buf));
-    if (r > 0)
+    if (poll(fds, 2, -1) == -1)
     {
-      write(STDERR_FILENO, buf, r);
-      if (errorFile)
-        fwrite(buf, 1, r, errorFile);
-      continue;
+      if (errno == EINTR)
+        continue;
+      break;
     }
-    if (r == -1 && errno == EINTR)
-      continue;
-    break; // EOF: bash finished
+    for (int k = 0; k < 2; k++)
+    {
+      if (fds[k].fd < 0 || !(fds[k].revents & (POLLIN | POLLHUP | POLLERR)))
+        continue;
+      ssize_t r = read(fds[k].fd, buf, sizeof(buf));
+      if (r > 0)
+      {
+        if (k == 0)
+        {
+          write(STDOUT_FILENO, buf, r);
+          *stdoutBytes += r;
+        }
+        else
+        {
+          write(STDERR_FILENO, buf, r);
+          if (errorFile)
+            fwrite(buf, 1, r, errorFile);
+        }
+      }
+      else if (r == 0 || errno != EINTR) // EOF on this pipe
+      {
+        close(fds[k].fd);
+        fds[k].fd = -1;
+        open--;
+      }
+    }
   }
-  close(errPipe[0]);
   if (errorFile)
     fclose(errorFile);
 
@@ -257,6 +296,109 @@ static int runAICommands(AICommands *commands, const char *scriptPath, const cha
   if (WIFEXITED(status))
     return WEXITSTATUS(status);
   return STATUS_SIGNAL_BASE + WTERMSIG(status);
+}
+
+/* Prints up to maxLines lines of a small text file, framed, so the user sees what was written. */
+static void showFileContents(const char *path, int maxLines)
+{
+  struct stat st;
+  if (stat(path, &st) == -1 || !S_ISREG(st.st_mode) || st.st_size > 64 * 1024)
+    return;
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return;
+  printf("\n\033[1;36m%s\033[0m\n", path);
+  char line[1024];
+  int n = 0;
+  while (fgets(line, sizeof(line), f))
+  {
+    if (++n > maxLines)
+    {
+      printf("  \033[36m│\033[0m ... (more lines, see: show %s)\n", path);
+      break;
+    }
+    line[strcspn(line, "\n")] = '\0';
+    printf("  \033[36m│\033[0m %s\n", line);
+  }
+  if (n == 0)
+    printf("  \033[36m│\033[0m (empty file)\n");
+  fclose(f);
+}
+
+/*
+ * When the AI's commands printed nothing, show their result anyway:
+ * every file they wrote with "> file" or ">> file" (heredoc bodies are skipped),
+ * and every folder they made with mkdir.
+ */
+static void showSilentResult(AICommands *commands)
+{
+  bool shownSomething = false;
+  char heredocEnd[64] = "";
+
+  for (int i = 0; i < commands->commandsCount; i++)
+  {
+    const char *line = commands->commands[i];
+
+    if (heredocEnd[0]) // inside a heredoc body: only look for its end marker
+    {
+      if (strcmp(line, heredocEnd) == 0)
+        heredocEnd[0] = '\0';
+      continue;
+    }
+
+    // start of a heredoc: remember its end marker, e.g. << 'EOF'  or  <<EOF
+    const char *h = strstr(line, "<<");
+    if (h)
+    {
+      h += 2;
+      while (*h == ' ' || *h == '-' || *h == '\'' || *h == '"')
+        h++;
+      size_t k = 0;
+      while (h[k] && h[k] != '\'' && h[k] != '"' && h[k] != ' ' && k < sizeof(heredocEnd) - 1)
+      {
+        heredocEnd[k] = h[k];
+        k++;
+      }
+      heredocEnd[k] = '\0';
+    }
+
+    // a file written with > or >> (not 2> and not >&)
+    for (const char *p = line; (p = strchr(p, '>')) != NULL; p++)
+    {
+      if ((p > line && (p[-1] == '2' || p[-1] == '&')) || p[1] == '&')
+        continue;
+      const char *q = p + 1;
+      if (*q == '>')
+        q++;
+      while (*q == ' ')
+        q++;
+      char target[PATH_MAX];
+      size_t t = 0;
+      while (*q && *q != ' ' && *q != ';' && *q != '&' && *q != '|' && t < sizeof(target) - 1)
+      {
+        if (*q != '\'' && *q != '"')
+          target[t++] = *q;
+        q++;
+      }
+      target[t] = '\0';
+      if (t > 0 && strcmp(target, "/dev/null") != 0)
+      {
+        showFileContents(target, 40);
+        shownSomething = true;
+      }
+      break;
+    }
+
+    // folders made with mkdir
+    if (strncmp(line, "mkdir ", 6) == 0)
+    {
+      printf("\n\033[1;36mcreated folder(s):\033[0m %s\n", line + 6);
+      shownSomething = true;
+    }
+  }
+
+  if (!shownSomething)
+    printf("\n(the commands ran but printed nothing)\n");
 }
 
 /* Runs ai/interface.py once. Returns 0 if it produced an output file. */
@@ -417,9 +559,12 @@ int commandAI(char **args)
       }
       printf("\n");
 
-      int code = runAICommands(commands, scriptPath, errorPath);
+      long printed = 0;
+      int code = runAICommands(commands, scriptPath, errorPath, &printed);
       if (code == 0) // all commands succeeded
       {
+        if (printed == 0) // nothing on screen yet: show what the commands produced
+          showSilentResult(commands);
         printf("\n\033[32m✓ Done - all commands finished successfully.\033[0m\n");
         exitCode = 0;
         goto exitAI;
