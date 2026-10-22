@@ -393,9 +393,10 @@ int commandAI(char **args)
     {
       if (commands->commandsCount > 0)
       {
-        printf("\nCommands: \n");
+        // show the script as one block (a heredoc spans several lines, so no per-line bullets)
+        printf("\nCommands to run:\n");
         for (int i = 0; i < commands->commandsCount; i++)
-          printf("- %s\n", commands->commands[i]);
+          printf("  \033[36m│\033[0m %s\n", commands->commands[i]);
       }
       printf("\n\033[32mExplanation: %s\033[0m\n", TEXT_OR_EMPTY(commands->explanation));
       if (commands->warning && commands->warning[0])
@@ -419,6 +420,7 @@ int commandAI(char **args)
       int code = runAICommands(commands, scriptPath, errorPath);
       if (code == 0) // all commands succeeded
       {
+        printf("\n\033[32m✓ Done - all commands finished successfully.\033[0m\n");
         exitCode = 0;
         goto exitAI;
       }

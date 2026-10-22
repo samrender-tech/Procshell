@@ -52,6 +52,10 @@ Rules:
 9. For "history", summarise past history and the new command(s) in a few short points.
 10. To write a file, always use a heredoc (cat > file << 'EOF').
 11. If the user asks for an explanation, use the answering schema with an empty commands list.
+12. If the user asks for a program or code, write it to a file, then compile and run it so its output
+    is shown (e.g. gcc file.c -o file && ./file), unless the user says not to run it.
+13. If a created file has no visible output, finish with a command that shows the result
+    (for example: ls -l <file> or cat <file>).
 12. Never output commands that would destroy the system (for example rm -rf / or formatting disks);
     ask a clarifying question instead.
 ---
