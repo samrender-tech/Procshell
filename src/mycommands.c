@@ -9,6 +9,7 @@
  *   copy     -> open(), read(), write(), fstat()     (like cp)
  *   move     -> rename()                             (like mv)
  *   fileinfo -> lstat(), getpwuid(), getgrgid()      (like stat)
+ *   (tree, search, diskuse, count, peek, chmode, makelink: see the second half of this file)
  */
 
 #include <dirent.h>
@@ -167,14 +168,26 @@ int commandHelp(char **args)
   printf("  remove [-y] <path>...       delete files or empty folders, asks first   (like rm)\n");
   printf("  copy <source> <dest>        copy a file                                 (like cp)\n");
   printf("  move <source> <dest>        move or rename                              (like mv)\n");
-  printf("  fileinfo <path>...          inode, size, owner, permissions, times      (like stat)\n\n");
+  printf("  fileinfo <path>...          inode, size, owner, permissions, times      (like stat)\n");
+  printf("  tree [-d depth] [folder]    folder tree                                 (like tree)\n");
+  printf("  search <text> [folder]      find files whose name contains text         (like find)\n");
+  printf("  diskuse [folder]            total size and the biggest items            (like du)\n");
+  printf("  count [file]...             lines, words and bytes                      (like wc)\n");
+  printf("  peek [-n N] [file]...       first N lines of a file                     (like head)\n");
+  printf("  chmode <octal> <path>...    change permissions, e.g. chmode 755 run.sh  (like chmod)\n");
+  printf("  makelink [-s] <target> <name>  hard or symbolic link                    (like ln)\n\n");
 
   printf("%sNavigation%s\n", b, r);
   printf("  where                       show the current folder                     (like pwd)\n");
   printf("  goto [folder]               change folder, home if empty                (like cd)\n\n");
 
   printf("%sOS insight%s\n", b, r);
-  printf("  trace [on|off]              show fork, pipes, exec, wait, signals and CPU/memory stats\n\n");
+  printf("  trace [on|off]              show fork, pipes, exec, wait, signals and CPU/memory stats\n");
+  printf("  timeit <command line>       run a command and report time, CPU and memory\n");
+  printf("  sysinfo                     OS, CPUs, memory, load average, shell uptime\n");
+  printf("  procinfo [pid]              process ids, group, session, priority, resource limits\n");
+  printf("  signal [-g] <pid> <signal>  send stop / cont / term / kill ... (signal -l lists them)\n");
+  printf("  history [n]                 numbered list of past commands\n\n");
 
   printf("%sAI%s\n", b, r);
   printf("  ai <request>                turn plain English into commands, e.g. ai make a folder demo\n\n");
@@ -636,4 +649,553 @@ int commandFileinfo(char **args)
       printf("\n");
   }
   return status;
+}
+
+/* ======================================================================
+ * More file-system commands
+ *
+ *   tree     -> opendir(), readdir(), lstat()  recursively      folder tree
+ *   search   -> opendir(), readdir()  recursively               find by name
+ *   diskuse  -> lstat() st_size  recursively                    folder sizes
+ *   count    -> read()                                          lines / words / bytes
+ *   peek     -> read(), write()                                 first N lines
+ *   chmode   -> stat(), chmod()                                 change permissions
+ *   makelink -> link(), symlink(), lstat()                      hard and symbolic links
+ * ====================================================================== */
+
+#define MAX_TREE_DEPTH 32
+
+static bool isHiddenName(const char *name)
+{
+  return name[0] == '.';
+}
+
+/* Sorted list of the visible names in a folder; caller frees with freeNames. */
+static char **listFolder(const char *path, size_t *countOut, bool includeHidden)
+{
+  *countOut = 0;
+  DIR *dir = opendir(path);
+  if (!dir)
+    return NULL;
+
+  size_t count = 0, capacity = 16;
+  char **names = malloc(capacity * sizeof(char *));
+  struct dirent *de;
+  while (names && (de = readdir(dir)) != NULL)
+  {
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+      continue;
+    if (!includeHidden && isHiddenName(de->d_name))
+      continue;
+    if (count == capacity)
+    {
+      capacity *= 2;
+      char **grown = realloc(names, capacity * sizeof(char *));
+      if (!grown)
+        break;
+      names = grown;
+    }
+    names[count++] = strdup(de->d_name);
+  }
+  closedir(dir);
+
+  for (size_t i = 1; i < count; i++) // insertion sort, folders are small
+  {
+    char *key = names[i];
+    size_t j = i;
+    while (j > 0 && strcasecmp(names[j - 1], key) > 0)
+    {
+      names[j] = names[j - 1];
+      j--;
+    }
+    names[j] = key;
+  }
+  *countOut = count;
+  return names;
+}
+
+static void freeNames(char **names, size_t count)
+{
+  if (!names)
+    return;
+  for (size_t i = 0; i < count; i++)
+    free(names[i]);
+  free(names);
+}
+
+/* ---------- tree ---------- */
+
+typedef struct
+{
+  int folders;
+  int files;
+  int maxDepth;
+  bool color;
+} TreeState;
+
+static void treeWalk(const char *path, const char *prefix, int depth, TreeState *state)
+{
+  size_t count;
+  char **names = listFolder(path, &count, false);
+  if (!names)
+    return;
+
+  for (size_t i = 0; i < count; i++)
+  {
+    bool last = (i == count - 1);
+    char *child = joinPath(path, names[i]);
+    struct stat st;
+    bool ok = child && lstat(child, &st) == 0;
+    bool isDir = ok && S_ISDIR(st.st_mode);
+    bool isLink = ok && S_ISLNK(st.st_mode);
+
+    const char *start = "", *end = "";
+    if (state->color && isDir)
+    {
+      start = "\033[1;34m";
+      end = "\033[0m";
+    }
+    else if (state->color && isLink)
+    {
+      start = "\033[36m";
+      end = "\033[0m";
+    }
+    printf("%s%s%s%s%s%s\n", prefix, last ? "└── " : "├── ", start, names[i], isDir ? "/" : "", end);
+
+    if (isDir)
+    {
+      state->folders++;
+      if (depth + 1 < state->maxDepth)
+      {
+        size_t prefixLen = strlen(prefix) + 8;
+        char *nextPrefix = malloc(prefixLen);
+        if (nextPrefix)
+        {
+          snprintf(nextPrefix, prefixLen, "%s%s", prefix, last ? "    " : "│   ");
+          treeWalk(child, nextPrefix, depth + 1, state);
+          free(nextPrefix);
+        }
+      }
+    }
+    else
+      state->files++;
+    free(child);
+  }
+  freeNames(names, count);
+}
+
+int commandTree(char **args)
+{
+  TreeState state = {0, 0, 3, useColor(STDOUT_FILENO)};
+  const char *root = ".";
+  for (int i = 1; args[i]; i++)
+  {
+    if (strcmp(args[i], "-d") == 0 && args[i + 1])
+    {
+      state.maxDepth = atoi(args[++i]);
+      if (state.maxDepth < 1 || state.maxDepth > MAX_TREE_DEPTH)
+      {
+        fprintf(stderr, "tree: depth must be 1-%d\n", MAX_TREE_DEPTH);
+        return 1;
+      }
+    }
+    else
+      root = args[i];
+  }
+
+  struct stat st;
+  if (stat(root, &st) == -1 || !S_ISDIR(st.st_mode))
+  {
+    fprintf(stderr, "tree: %s: not a folder\n", root);
+    return 1;
+  }
+  printf("%s%s/%s\n", state.color ? "\033[1;34m" : "", root, state.color ? "\033[0m" : "");
+  treeWalk(root, "", 0, &state);
+  printf("\n%d folder%s, %d file%s (depth %d, hidden items skipped)\n", state.folders, state.folders == 1 ? "" : "s",
+         state.files, state.files == 1 ? "" : "s", state.maxDepth);
+  return 0;
+}
+
+/* ---------- search ---------- */
+
+/* case-insensitive "does haystack contain needle" */
+static bool containsIgnoreCase(const char *haystack, const char *needle)
+{
+  size_t n = strlen(needle);
+  for (; *haystack; haystack++)
+    if (strncasecmp(haystack, needle, n) == 0)
+      return true;
+  return n == 0;
+}
+
+static void searchWalk(const char *path, const char *text, int depth, int *matches, bool color)
+{
+  if (depth > MAX_TREE_DEPTH)
+    return;
+  size_t count;
+  char **names = listFolder(path, &count, false);
+  if (!names)
+    return;
+
+  for (size_t i = 0; i < count; i++)
+  {
+    char *child = joinPath(path, names[i]);
+    if (!child)
+      continue;
+    struct stat st;
+    bool isDir = lstat(child, &st) == 0 && S_ISDIR(st.st_mode);
+    if (containsIgnoreCase(names[i], text))
+    {
+      (*matches)++;
+      printf("%s%s%s%s\n", color && isDir ? "\033[1;34m" : "", child, isDir ? "/" : "", color && isDir ? "\033[0m" : "");
+    }
+    if (isDir)
+      searchWalk(child, text, depth + 1, matches, color);
+    free(child);
+  }
+  freeNames(names, count);
+}
+
+int commandSearch(char **args)
+{
+  if (!args[1] || (args[2] && args[3]))
+  {
+    fprintf(stderr, "usage: search <text> [folder]     finds files whose name contains <text>\n");
+    return 1;
+  }
+  const char *root = args[2] ? args[2] : ".";
+  int matches = 0;
+  searchWalk(root, args[1], 0, &matches, useColor(STDOUT_FILENO));
+  printf("\n%d match%s for '%s' under %s (hidden folders skipped)\n", matches, matches == 1 ? "" : "es", args[1], root);
+  return matches > 0 ? 0 : 1;
+}
+
+/* ---------- diskuse ---------- */
+
+typedef struct
+{
+  char *name;
+  off_t bytes;
+  bool isDir;
+} SizedEntry;
+
+static off_t sizeOfPath(const char *path, int depth, long *fileCount)
+{
+  struct stat st;
+  if (lstat(path, &st) == -1)
+    return 0;
+  if (!S_ISDIR(st.st_mode))
+  {
+    (*fileCount)++;
+    return st.st_size;
+  }
+  if (depth > MAX_TREE_DEPTH)
+    return 0;
+
+  off_t total = 0;
+  size_t count;
+  char **names = listFolder(path, &count, true);
+  for (size_t i = 0; names && i < count; i++)
+  {
+    char *child = joinPath(path, names[i]);
+    if (child)
+      total += sizeOfPath(child, depth + 1, fileCount);
+    free(child);
+  }
+  freeNames(names, count);
+  return total;
+}
+
+static int compareSizeDesc(const void *a, const void *b)
+{
+  off_t x = ((const SizedEntry *)a)->bytes, y = ((const SizedEntry *)b)->bytes;
+  return (x < y) - (x > y);
+}
+
+int commandDiskuse(char **args)
+{
+  const char *root = args[1] ? args[1] : ".";
+  struct stat st;
+  if (lstat(root, &st) == -1)
+  {
+    perror(root);
+    return 1;
+  }
+
+  char total[16];
+  long files = 0;
+  if (!S_ISDIR(st.st_mode))
+  {
+    humanSize(st.st_size, total, sizeof(total));
+    printf("%s  %s\n", total, root);
+    return 0;
+  }
+
+  size_t count;
+  char **names = listFolder(root, &count, true);
+  SizedEntry *entries = calloc(count ? count : 1, sizeof(SizedEntry));
+  off_t sum = 0;
+  for (size_t i = 0; names && entries && i < count; i++)
+  {
+    char *child = joinPath(root, names[i]);
+    struct stat cst;
+    entries[i].name = names[i];
+    entries[i].isDir = child && lstat(child, &cst) == 0 && S_ISDIR(cst.st_mode);
+    entries[i].bytes = child ? sizeOfPath(child, 1, &files) : 0;
+    sum += entries[i].bytes;
+    free(child);
+  }
+  if (entries)
+    qsort(entries, count, sizeof(SizedEntry), compareSizeDesc);
+
+  bool color = useColor(STDOUT_FILENO);
+  size_t shown = count < 10 ? count : 10;
+  for (size_t i = 0; entries && i < shown; i++)
+  {
+    char size[16];
+    humanSize(entries[i].bytes, size, sizeof(size));
+    int bar = sum > 0 ? (int)(entries[i].bytes * 20 / sum) : 0;
+    char bars[21];
+    memset(bars, '#', bar);
+    bars[bar] = '\0';
+    printf("  %8s  %-20s  %s%s%s%s\n", size, bars, color && entries[i].isDir ? "\033[1;34m" : "", entries[i].name,
+           entries[i].isDir ? "/" : "", color && entries[i].isDir ? "\033[0m" : "");
+  }
+  if (count > shown)
+    printf("  ... and %zu more\n", count - shown);
+
+  humanSize(sum, total, sizeof(total));
+  printf("\n  total %s in %ld file%s under %s\n", total, files, files == 1 ? "" : "s", root);
+  free(entries);
+  freeNames(names, count);
+  return 0;
+}
+
+/* ---------- count ---------- */
+
+typedef struct
+{
+  long lines, words, bytes;
+} Counts;
+
+static int countFd(int fd, Counts *c)
+{
+  char buf[8192];
+  bool inWord = false;
+  for (;;)
+  {
+    ssize_t r = read(fd, buf, sizeof(buf));
+    if (r == 0)
+      return 0;
+    if (r == -1)
+    {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    c->bytes += r;
+    for (ssize_t i = 0; i < r; i++)
+    {
+      if (buf[i] == '\n')
+        c->lines++;
+      bool space = isspace((unsigned char)buf[i]);
+      if (!space && !inWord)
+        c->words++;
+      inWord = !space;
+    }
+  }
+}
+
+int commandCount(char **args)
+{
+  printf("%8s %8s %10s\n", "lines", "words", "bytes");
+  if (!args[1]) // no file: count stdin, so "display | count" works
+  {
+    Counts c = {0, 0, 0};
+    if (countFd(STDIN_FILENO, &c) == -1)
+      return 1;
+    printf("%8ld %8ld %10ld\n", c.lines, c.words, c.bytes);
+    return 0;
+  }
+
+  Counts total = {0, 0, 0};
+  int status = 0, files = 0;
+  for (int i = 1; args[i]; i++)
+  {
+    int fd = open(args[i], O_RDONLY);
+    Counts c = {0, 0, 0};
+    if (fd == -1 || countFd(fd, &c) == -1)
+    {
+      perror(args[i]);
+      status = 1;
+      if (fd != -1)
+        close(fd);
+      continue;
+    }
+    close(fd);
+    printf("%8ld %8ld %10ld  %s\n", c.lines, c.words, c.bytes, args[i]);
+    total.lines += c.lines;
+    total.words += c.words;
+    total.bytes += c.bytes;
+    files++;
+  }
+  if (files > 1)
+    printf("%8ld %8ld %10ld  total\n", total.lines, total.words, total.bytes);
+  return status;
+}
+
+/* ---------- peek ---------- */
+
+static int peekFd(int fd, long lines)
+{
+  char buf[4096];
+  long seen = 0;
+  while (seen < lines)
+  {
+    ssize_t r = read(fd, buf, sizeof(buf));
+    if (r == 0)
+      break;
+    if (r == -1)
+    {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    ssize_t upto = r;
+    for (ssize_t i = 0; i < r; i++)
+    {
+      if (buf[i] == '\n' && ++seen == lines)
+      {
+        upto = i + 1;
+        break;
+      }
+    }
+    if (writeAll(STDOUT_FILENO, buf, upto) == -1)
+      return -1;
+  }
+  return 0;
+}
+
+int commandPeek(char **args)
+{
+  long lines = 10;
+  int a = 1;
+  if (args[1] && strcmp(args[1], "-n") == 0)
+  {
+    if (!args[2] || (lines = atol(args[2])) <= 0)
+    {
+      fprintf(stderr, "usage: peek [-n lines] [file]...\n");
+      return 1;
+    }
+    a = 3;
+  }
+
+  if (!args[a]) // no file: read stdin, so "history | peek -n 3" works
+    return peekFd(STDIN_FILENO, lines) == 0 ? 0 : 1;
+
+  int status = 0;
+  for (int i = a; args[i]; i++)
+  {
+    int fd = open(args[i], O_RDONLY);
+    if (fd == -1)
+    {
+      perror(args[i]);
+      status = 1;
+      continue;
+    }
+    if (args[a + 1])
+      printf("==> %s <==\n", args[i]);
+    fflush(stdout);
+    if (peekFd(fd, lines) == -1)
+    {
+      perror(args[i]);
+      status = 1;
+    }
+    close(fd);
+  }
+  return status;
+}
+
+/* ---------- chmode ---------- */
+
+int commandChmode(char **args)
+{
+  if (!args[1] || !args[2])
+  {
+    fprintf(stderr, "usage: chmode <octal mode> <path>...     e.g. chmode 755 run.sh\n");
+    return 1;
+  }
+
+  char *end;
+  long mode = strtol(args[1], &end, 8);
+  if (*end != '\0' || mode < 0 || mode > 07777)
+  {
+    fprintf(stderr, "chmode: '%s' is not an octal mode like 644 or 755\n", args[1]);
+    return 1;
+  }
+
+  int status = 0;
+  for (int i = 2; args[i]; i++)
+  {
+    struct stat st;
+    if (stat(args[i], &st) == -1)
+    {
+      perror(args[i]);
+      status = 1;
+      continue;
+    }
+    char before[11], after[11];
+    permissionString(st.st_mode, before);
+    if (chmod(args[i], (mode_t)mode) == -1)
+    {
+      perror(args[i]);
+      status = 1;
+      continue;
+    }
+    permissionString((st.st_mode & ~07777) | (mode_t)mode, after);
+    printf("%s  %s (%04o) -> %s (%04lo)\n", args[i], before, (unsigned)(st.st_mode & 07777), after, mode);
+  }
+  return status;
+}
+
+/* ---------- makelink ---------- */
+
+int commandMakelink(char **args)
+{
+  bool symbolic = false;
+  int a = 1;
+  if (args[1] && strcmp(args[1], "-s") == 0)
+  {
+    symbolic = true;
+    a = 2;
+  }
+  if (!args[a] || !args[a + 1] || args[a + 2])
+  {
+    fprintf(stderr, "usage: makelink [-s] <target> <link name>\n");
+    fprintf(stderr, "  without -s: hard link  (a second name for the same inode)\n");
+    fprintf(stderr, "  with -s:    symbolic link (a small file that points to a path)\n");
+    return 1;
+  }
+  const char *target = args[a], *name = args[a + 1];
+
+  if ((symbolic ? symlink(target, name) : link(target, name)) == -1)
+  {
+    perror("makelink");
+    return 1;
+  }
+
+  struct stat st;
+  if (symbolic)
+  {
+    printf("symbolic link %s -> %s\n", name, target);
+    if (lstat(name, &st) == 0)
+      printf("  the link has its own inode %llu; it stores the path, not the data\n", (unsigned long long)st.st_ino);
+  }
+  else if (stat(name, &st) == 0)
+  {
+    printf("hard link %s = %s\n", name, target);
+    printf("  both names share inode %llu, link count is now %llu\n", (unsigned long long)st.st_ino,
+           (unsigned long long)st.st_nlink);
+  }
+  return 0;
 }

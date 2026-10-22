@@ -13,7 +13,7 @@ redirections, handling signals and reaping children — directly on POSIX system
 
 On top of that it adds three things a normal terminal does not have:
 
-- **Its own commands** (`display`, `show`, `copy`, `fileinfo`, …) written on system calls instead of calling `ls`, `cat` or `cp`.
+- **Its own commands** — 20+ commands (`display`, `tree`, `diskuse`, `fileinfo`, `sysinfo`, `procinfo`, `signal`, `timeit`, …) written on system calls instead of calling `ls`, `du`, `stat` or `kill`.
 - **Trace mode** — `trace on` prints every `pipe`, `fork`, `exec`, `wait` and signal as it happens, plus CPU time and peak memory for each command.
 - **An AI assistant** — `ai <plain English>` turns a request into shell commands, shows them, and runs them only after you confirm.
 
@@ -79,11 +79,50 @@ Implemented in [`src/mycommands.c`](src/mycommands.c). None of them start an ext
 | `copy <src> <dest>` | `cp` | `open`, `read`, `write`, `fstat` |
 | `move <src> <dest>` | `mv` | `rename` (copy + `unlink` across disks) |
 | `fileinfo <path>...` | `stat` (inode, owner, links, times) | `lstat`, `getpwuid`, `getgrgid` |
+| `tree [-d depth] [folder]` | `tree` | `opendir`, `readdir`, `lstat` (recursive) |
+| `search <text> [folder]` | `find -name` | `opendir`, `readdir` (recursive) |
+| `diskuse [folder]` | `du` (with a size bar per item) | `lstat` (recursive) |
+| `count [file]...` | `wc` | `read` |
+| `peek [-n N] [file]...` | `head` | `read`, `write` |
+| `chmode <octal> <path>...` | `chmod` (shows old → new) | `stat`, `chmod` |
+| `makelink [-s] <target> <name>` | `ln` (shows inode / link count) | `link`, `symlink`, `lstat` |
 | `where` / `goto [folder]` | `pwd` / `cd` | `getcwd` / `chdir` |
-| `trace [on\|off]` | — | shows the OS steps of every command |
 | `help` | — | lists every command |
 
-They compose with the rest of the shell: `display | show`, `display > list.txt`.
+They compose with the rest of the shell: `display | count`, `history | peek -n 3`, `tree > layout.txt`.
+
+### Process and OS commands
+Implemented in [`src/oscommands.c`](src/oscommands.c).
+
+| Command | What it shows | System calls |
+|---|---|---|
+| `trace [on\|off]` | every `pipe`, `fork`, `exec`, `wait` and signal, plus CPU/memory per command | `wait4` |
+| `timeit <command line>` | real time, user/system CPU, peak memory, process count | `wait4`, `clock_gettime` |
+| `sysinfo` | OS, architecture, CPUs, physical memory, page size, load average, shell uptime | `uname`, `sysconf`, `getloadavg`, `getrlimit` |
+| `procinfo [pid]` | PID, parent, process group, session, terminal ownership, nice value, umask, resource limits | `getpgid`, `getsid`, `tcgetpgrp`, `getpriority`, `getrlimit` |
+| `signal [-g] <pid> <sig>` | send `stop`, `cont`, `term`, `kill`, … to a process or a whole job (`signal -l` lists them) | `kill` |
+| `history [n]` | numbered command history | history linked list |
+
+Pausing and resuming a background job:
+```text
+$ sleep 60 &
+Process Group: 4417
+$ signal -g 4417 stop          # every process of the job is now stopped (state T)
+sent SIGSTOP (19) to process group 4417
+$ procinfo 4417
+  Process group    4417  (group leader)
+  Has terminal     no (background)
+$ signal -g 4417 cont          # running again
+$ timeit "seq 1 200000 | sort -r > /dev/null"
+─── timeit ───────────────────────
+  real time         0.047 s
+  user CPU          0.034 s
+  system CPU        0.011 s
+  peak memory         9.5 MB
+  processes             2
+  exit status           0
+──────────────────────────────────
+```
 
 ### AI assistant
 ```text
@@ -104,6 +143,7 @@ $ ai create a folder named demo, write a C hello world in it, then compile and r
 - **Process groups and terminal control.** Each job gets its own process group (`setpgid` from both parent and child, avoiding the classic race) and is handed the terminal with `tcsetpgrp`, so Ctrl+C reaches the job and never the shell.
 - **A real race condition, found and fixed.** The `SIGCHLD` handler could reap a foreground child before the shell's own `wait`, silently losing exit statuses (`false && echo yes` sometimes printed `yes`). Fixed by blocking `SIGCHLD` with `sigprocmask` while a pipeline runs and restoring the original mask in children before `execve`. Verified across 40 repeated runs.
 - **bash-compatible chaining.** `&&`/`||` skip a pipeline rather than abort the chain, so `false && a || b` runs `b`; a failing command does not stop a `;` list, but Ctrl+C (exit 130) does.
+- **Whole-job signalling.** Every process of a background job joins the job's process group, so `signal -g <pgid> stop` pauses the entire job, exactly like job control in a real shell.
 - **Per-command resource accounting** with `wait4` (`ru_utime`, `ru_stime`, `ru_maxrss`, handled for both Linux and macOS units).
 - **Raw-mode line editor** with line-wrap-aware cursor movement and a fixed-size doubly linked list for history.
 - **Clean build** with `-Wall -Wextra` and no warnings.
@@ -132,10 +172,12 @@ keystrokes ──► line editor (termios raw mode)
 | Inter-process communication | `pipe` |
 | File descriptors and redirection | `open`, `dup2`, `close` |
 | Process groups and terminal control | `setpgid`, `tcsetpgrp`, `getpgrp` |
-| Signals | `sigaction` (`SIGINT`, `SIGCHLD`, `SIGWINCH`), `SIGTTOU` / `SIGTSTP` ignored |
+| Signals | `sigaction` (`SIGINT`, `SIGCHLD`, `SIGWINCH`), `kill` for `signal`, `SIGTTOU` / `SIGTSTP` ignored |
+| Process attributes and limits | `getpgid`, `getsid`, `getpriority`, `getrlimit`, `umask` |
+| System information | `uname`, `sysconf`, `getloadavg` |
 | Synchronization | `sigprocmask` |
 | Terminal I/O | `tcgetattr`, `tcsetattr` (raw mode), `ioctl(TIOCGWINSZ)` |
-| File system | `opendir`, `readdir`, `lstat`, `mkdir`, `unlink`, `rmdir`, `rename` |
+| File system | `opendir`, `readdir`, `lstat`, `mkdir`, `unlink`, `rmdir`, `rename`, `chmod`, `link`, `symlink` |
 
 Design diagrams are in [`docs/diagrams/`](docs/diagrams).
 
@@ -174,7 +216,8 @@ procshell/
 │   ├── parser.c         tokenizer, $VAR expansion, command tree
 │   ├── executor.c       fork / exec / wait, pipes, redirection, process groups, trace points
 │   ├── builtins.c       cd, export, unset, source, echo, which, env, ai
-│   ├── mycommands.c     display, show, copy, move, fileinfo, … and trace mode
+│   ├── mycommands.c     file commands (display, tree, diskuse, …) and trace mode
+│   ├── oscommands.c     sysinfo, procinfo, signal, timeit, history
 │   ├── helpers.c        signal handler, command dispatch, allocation helpers
 │   ├── aiParser.c       parses the AI's structured reply
 │   └── forgettingDLL.c  fixed-capacity doubly linked list for history
@@ -189,8 +232,8 @@ procshell/
 
 ## Roadmap
 
-- [ ] Job control: `jobs`, `fg`, `bg` and Ctrl+Z (`SIGTSTP` / `SIGCONT`) — Ctrl+Z is ignored until then
-- [ ] `history` command with persistent history, `alias`, wildcard globbing (`*.c`), tab completion
+- [ ] Job control: `jobs`, `fg`, `bg` and Ctrl+Z — background jobs can already be paused and resumed with `signal -g <pgid> stop|cont`
+- [ ] Persistent history across sessions, `alias`, wildcard globbing (`*.c`), tab completion
 - [ ] stderr redirection (`2>`, `2>&1`) and full bash quoting rules
 - [ ] Automated test suite
 - [ ] AI: `why` to explain the last failure; a C-side safety check on generated commands

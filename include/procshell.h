@@ -15,6 +15,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/utsname.h>
+#include <time.h>
 
 #include <sys/wait.h>
 
@@ -49,6 +50,7 @@ extern volatile int termCols;             /* terminal width */
 extern sigset_t shellOrigMask;            /* signal mask at startup, restored in children */
 extern char *procshellHome;               /* folder containing the procshell binary */
 extern char *procshellDataDir;            /* ~/.procshell - AI temp files live here */
+extern time_t procshellStartTime;         /* when the shell started (for sysinfo) */
 
 #include "types/parser.h"
 #include "types/ai.h"

@@ -474,7 +474,8 @@ int commandWhich(char **args, char **env)
   // if one of these then it's a builtin command
   const char *builtIns[] = {"cd", "export", "unset", "source", "exit", "quit", "pwd", "echo", "env", "which", "ai",
                             "help", "display", "show", "makedir", "makefile", "remove", "copy", "move",
-                            "fileinfo", "where", "goto", "trace"};
+                            "fileinfo", "where", "goto", "trace", "tree", "search", "diskuse", "count", "peek",
+                            "chmode", "makelink", "sysinfo", "procinfo", "signal", "timeit", "history"};
 
   for (size_t i = 0; i < sizeof(builtIns) / sizeof(builtIns[0]); i++)
   {

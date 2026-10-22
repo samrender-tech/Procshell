@@ -10,6 +10,7 @@ ForgettingDoublyLinkedList *history = NULL;
 sigset_t shellOrigMask;        // signal mask at startup - children get this back before exec
 char *procshellHome = NULL;    // folder that contains the procshell binary (and ai/interface.py)
 char *procshellDataDir = NULL; // ~/.procshell - AI temp/context files
+time_t procshellStartTime = 0; // when the shell started
 
 void shellLoop(char **env);
 
@@ -61,6 +62,7 @@ static char *createDataDirectory(void)
 int main(int argc, char const *argv[], char *envp[])
 {
   (void)argc;
+  procshellStartTime = time(NULL);
 
   sigprocmask(SIG_SETMASK, NULL, &shellOrigMask); // remember the normal signal mask
 

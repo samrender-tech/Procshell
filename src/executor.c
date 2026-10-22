@@ -2,6 +2,8 @@
 #include <time.h>
 #include "procshell.h"
 
+RunStats runStats = {0, 0, 0, 0, 0};
+
 /* "SIGINT" for 2, etc. - used by trace output */
 static const char *signalName(int sig)
 {
@@ -136,7 +138,10 @@ int executePipeline(Pipeline *pipeline, char ***env, char *initialDirectory, boo
   char *firstCommand = first->tokens->data[0]->token;
   if ((isBuiltin(firstCommand) || strcmp(firstCommand, "ai") == 0) && pipelineComponentCount > 1)
   {
-    fprintf(stderr, "%s: cannot be used in a pipeline\n", firstCommand);
+    if (strcmp(firstCommand, "timeit") == 0)
+      fprintf(stderr, "timeit: put a pipeline in quotes, e.g. timeit \"ls | wc -l\"\n");
+    else
+      fprintf(stderr, "%s: cannot be used in a pipeline\n", firstCommand);
     return STATUS_FAILURE;
   }
 
@@ -163,7 +168,9 @@ int executePipeline(Pipeline *pipeline, char ***env, char *initialDirectory, boo
     traceLog("pipe", "pipe %d created: read end fd %d, write end fd %d", i + 1, fds[i][0], fds[i][1]);
   }
 
-  int processGroup = INT_MIN;
+  // A background job already has its own process group (its subshell): every process of the job
+  // joins it, so one signal to that group (signal -g <pgid> stop) reaches the whole job.
+  int processGroup = isBackground ? (int)getpgrp() : INT_MIN;
   for (int i = 0; i < pipelineComponentCount; i++)
   {
     int status = executePipelineComponent(pipeline->components->data[i], env, fds, pipeCount, i, pids, initialDirectory, &processGroup, isBackground);
@@ -239,6 +246,13 @@ int executePipeline(Pipeline *pipeline, char ***env, char *initialDirectory, boo
     double realSeconds = (endTime.tv_sec - startTime.tv_sec) + (endTime.tv_nsec - startTime.tv_nsec) / 1e9;
     traceLog("stats", "real %.3fs | user CPU %.3fs | system CPU %.3fs | peak memory %.1f MB",
              realSeconds, userSeconds, systemSeconds, peakMemoryMB);
+
+    // running totals, read by the timeit command
+    runStats.realSeconds += realSeconds;
+    runStats.userSeconds += userSeconds;
+    runStats.systemSeconds += systemSeconds;
+    runStats.peakMemoryMB = MAX(runStats.peakMemoryMB, peakMemoryMB);
+    runStats.processes += waitedChildren;
   }
   sigprocmask(SIG_SETMASK, &prevMask, NULL);
   return lastStatus;

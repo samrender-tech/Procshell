@@ -255,7 +255,9 @@ bool isBuiltin(char *command)
       myStrcmp(command, "quit") == 0 ||
       myStrcmp(command, "source") == 0 ||
       myStrcmp(command, "goto") == 0 ||  // Procshell name for cd
-      myStrcmp(command, "trace") == 0)   // changes shell state, so it runs in the shell itself
+      myStrcmp(command, "trace") == 0 || // changes shell state, so it runs in the shell itself
+      myStrcmp(command, "procinfo") == 0 || // inspects the shell process itself
+      myStrcmp(command, "timeit") == 0)  // runs a command line through the executor
   {
     return true;
   }
@@ -349,6 +351,15 @@ int handleBuiltin(char **args, char ***env, char *initialDirectory)
   {
     return commandTrace(args) == 0 ? 0 : -1;
   }
+  else if (myStrcmp(args[0], "procinfo") == 0)
+  {
+    fflush(stdout);
+    return commandProcinfo(args) == 0 ? 0 : -1;
+  }
+  else if (myStrcmp(args[0], "timeit") == 0)
+  {
+    return commandTimeit(args, env, initialDirectory) == 0 ? 0 : -1;
+  }
 
   return -1;
 }
@@ -382,7 +393,17 @@ bool isMyImplementedBuiltin(char *command)
       myStrcmp(command, "copy") == 0 ||
       myStrcmp(command, "move") == 0 ||
       myStrcmp(command, "fileinfo") == 0 ||
-      myStrcmp(command, "where") == 0)
+      myStrcmp(command, "where") == 0 ||
+      myStrcmp(command, "tree") == 0 ||
+      myStrcmp(command, "search") == 0 ||
+      myStrcmp(command, "diskuse") == 0 ||
+      myStrcmp(command, "count") == 0 ||
+      myStrcmp(command, "peek") == 0 ||
+      myStrcmp(command, "chmode") == 0 ||
+      myStrcmp(command, "makelink") == 0 ||
+      myStrcmp(command, "sysinfo") == 0 ||
+      myStrcmp(command, "signal") == 0 ||
+      myStrcmp(command, "history") == 0)
   {
     return true;
   }
@@ -431,6 +452,26 @@ int handleMyImplementedBuiltin(char **args, char ***env, char *initialDirectory)
     return commandMove(args);
   else if (myStrcmp(args[0], "fileinfo") == 0)
     return commandFileinfo(args);
+  else if (myStrcmp(args[0], "tree") == 0)
+    return commandTree(args);
+  else if (myStrcmp(args[0], "search") == 0)
+    return commandSearch(args);
+  else if (myStrcmp(args[0], "diskuse") == 0)
+    return commandDiskuse(args);
+  else if (myStrcmp(args[0], "count") == 0)
+    return commandCount(args);
+  else if (myStrcmp(args[0], "peek") == 0)
+    return commandPeek(args);
+  else if (myStrcmp(args[0], "chmode") == 0)
+    return commandChmode(args);
+  else if (myStrcmp(args[0], "makelink") == 0)
+    return commandMakelink(args);
+  else if (myStrcmp(args[0], "sysinfo") == 0)
+    return commandSysinfo(args);
+  else if (myStrcmp(args[0], "signal") == 0)
+    return commandSignal(args);
+  else if (myStrcmp(args[0], "history") == 0)
+    return commandHistory(args);
   return -1;
 }
 
